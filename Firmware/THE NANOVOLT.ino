@@ -31,7 +31,9 @@ int8_t joyX();
 int8_t joyY();
 bool btnDown();
 bool btnPress();
+bool btnTap();
 bool backHold();
+bool pauseMenu();
 void beep(uint16_t fr, uint16_t ms);
 uint16_t eeR(uint8_t a);
 void eeW(uint8_t a, uint16_t v);
@@ -153,6 +155,23 @@ bool btnPress() {
   }
   return true;
 }
+
+// Non-blocking short-press ("tap") detector. Unlike btnPress(), this never
+// blocks the caller, so it can be polled every frame inside a running game
+// loop (Bounce/Space/Star/Maze) without freezing rendering. A press that
+// turns into a long hold is left for backHold() to handle as "quit to
+// menu" instead of also being reported here as a tap.
+bool btnTap() {
+  static bool wasDown = false;
+  static uint32_t downStart = 0;
+  bool down = btnDown();
+  bool tapped = false;
+  if (down && !wasDown) downStart = millis();
+  if (!down && wasDown && (millis() - downStart) < 700) tapped = true;
+  wasDown = down;
+  return tapped;
+}
+
 bool backHold() {
   if (gBackRequested) {
     gBackRequested = false;
@@ -192,10 +211,12 @@ void eeW(uint8_t a, uint16_t v) {
 }
 
 // ── Shared UI ─────────────────────────────────────────────────────────────
-uint8_t gDiff = 1, gBright = 3;
+uint8_t gDiff = 1, gBright = 2;
 
+// gBright is an index 0..4 into {Dim, Low, Medium, Bright, Max}.
 void applyBright() {
-  u8g2.setContrast(gBright == 1 ? 30 : gBright == 2 ? 80 : gBright == 3 ? 150 : gBright == 4 ? 200 : 255);
+  uint8_t c = gBright == 0 ? 30 : gBright == 1 ? 80 : gBright == 2 ? 150 : gBright == 3 ? 200 : 255;
+  u8g2.setContrast(c);
 }
 
 void drawStrF(u8g2_uint_t x, u8g2_uint_t y, const __FlashStringHelper* s) {
@@ -282,6 +303,21 @@ bool gameOverChoice(uint16_t score, uint8_t eeAddr) {
   return askRetryMenu();
 }
 
+// ── Pause menu (Continue / Back to Menu) ─────────────────────────────────
+const char pz0[] PROGMEM = "Continue";
+const char pz1[] PROGMEM = "Back to Menu";
+const char* const pauseItems[] PROGMEM = {pz0, pz1};
+
+// Called from the real-time games (Bounce/Space/Star/Maze) on a short
+// button tap while playing. Returns true to keep playing, false if the
+// player chose (or held-back to) return to the main menu.
+bool pauseMenu() {
+  beep(500, 30);
+  uint8_t r = drawMenu(pauseItems, 2, 0, F("Paused"));
+  if (r == 255) return false; // held back out of the pause menu itself
+  return r == 0;
+}
+
 // ── POST ──────────────────────────────────────────────────────────────────
 void runPOST() {
   bool oledOK = true;
@@ -304,16 +340,50 @@ void runPOST() {
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────
+// Typewriter boot sequence: "nano volt" builds up letter by letter, a
+// quick sparkle flourish plays over the finished word, then it punches up
+// into "NANOVOLT!" before settling into the normal logo/blink prompt.
+// Deliberately cheap on flash — one build-up loop, one sparkle loop, both
+// reusing text drawing that's already linked in elsewhere.
 void bootAnim() {
-  for (uint8_t r = 2; r <= 30; r += 4) {
+  static const char full[] = "nano volt";
+  char buf[10];
+  uint8_t len = strlen(full);
+
+  for (uint8_t i = 1; i <= len; i++) {
+    strncpy(buf, full, i);
+    buf[i] = '\0';
     u8g2.firstPage();
     do {
-      u8g2.drawCircle(64, 32, r);
-      if (r > 8)  u8g2.drawCircle(64, 32, r - 8);
-      if (r > 16) u8g2.drawCircle(64, 32, r - 16);
+      u8g2.setFont(u8g2_font_6x10_tf);
+      centerStrRAM(36, buf);
     } while (u8g2.nextPage());
-    delay(40);
+    beep(700 + i * 40, 25);
+    delay(90);
   }
+
+  // Sparkle flourish — a few random dots flicker around the finished word.
+  for (uint8_t f = 0; f < 5; f++) {
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_6x10_tf);
+      centerStrRAM(36, buf);
+      for (uint8_t s = 0; s < 6; s++) u8g2.drawPixel(random(10, 118), random(10, 58));
+    } while (u8g2.nextPage());
+    beep(1200 + f * 150, 15);
+    delay(70);
+  }
+
+  // Punch up into the final "NANOVOLT!" reveal.
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    centerStrF(36, F("NANOVOLT!"));
+  } while (u8g2.nextPage());
+  beep(1500, 150);
+  delay(500);
+
+  // Logo settles in, with the same blinking prompt as before.
   for (uint8_t f = 0; f < 12; f++) {
     u8g2.firstPage();
     do {
@@ -348,6 +418,7 @@ void playBounce() {
     uint16_t spd = (gDiff == 0) ? 55 : (gDiff == 1) ? 40 : 28;
     countdown();
     while (lives > 0) {
+      if (btnTap()) { if (!pauseMenu()) return; }
       if (backHold()) return;
       int8_t jx = joyX();
       px += jx * 3;
@@ -436,6 +507,7 @@ void playSpace() {
     uint8_t combo = 0; uint32_t lastKill = 0;
     countdown();
     while (true) {
+      if (btnTap()) { if (!pauseMenu()) return; }
       if (backHold()) return;
       // tilt-driven ship movement, proportional to how hard you tilt
       int16_t tx, ty; adxlXYFiltered(tx, ty);
@@ -539,6 +611,7 @@ void playStar() {
     uint16_t spd = (gDiff == 0) ? 65 : (gDiff == 1) ? 48 : 34;
     countdown();
     while (lives > 0) {
+      if (btnTap()) { if (!pauseMenu()) return; }
       if (backHold()) return;
       int16_t tx, ty; adxlXYFiltered(tx, ty);
       int8_t mv = tiltStep(tx);
@@ -574,27 +647,51 @@ void playStar() {
   }
 }
 
+#define MAZE_COUNT 2
+#define MAZE_W 16
+#define MAZE_H 8
+
+const char maze0[MAZE_H][MAZE_W + 1] PROGMEM = {
+  "################",
+  "#S#   #       ##",
+  "# # # # ##### ##",
+  "# # # #  G#   ##",
+  "# # # ##### # ##",
+  "#   #       # ##",
+  "################",
+  "################",
+};
+
+const char maze1[MAZE_H][MAZE_W + 1] PROGMEM = {
+  "################",
+  "#S    #       ##",
+  "##### ### ### ##",
+  "#   #   #   # ##",
+  "# # ### ### # ##",
+  "# #         #G##",
+  "################",
+  "################",
+};
+
+const char (*const mazeList[MAZE_COUNT])[MAZE_W + 1] = { maze0, maze1 };
 // ══════════════════════════════════════════════════════════════════════════
-// GAME 4 — XO  (Tic-Tac-Toe, joystick, 2-PLAYER hot-seat)
+// GAME 4 — MAZE RUNNER (ADXL345 tilt)
+// A handful of layouts (see mazes above), one picked at random every time
+// you enter the game or hit Retry, so it's not the same maze every run.
 // ══════════════════════════════════════════════════════════════════════════
-// GAME 4 - MAZE RUNNER (ADXL345 tilt)
+char pgm_read_cell(uint8_t mazeIdx, uint8_t x, uint8_t y) {
+  return (char)pgm_read_byte(&(mazeList[mazeIdx][y][x]));
+}
+
 void playMaze() {
-  static const char maze[8][17] = {
-    "################",
-    "#S     #       #",
-    "# ###  #  ###  #",
-    "#   #     #    #",
-    "### # ##### ## #",
-    "#   #     #    #",
-    "#     ###    G #",
-    "################"
-  };
   while (true) {
+    uint8_t mIdx = random(MAZE_COUNT);
     int8_t px = 1, py = 1;
     uint32_t start = millis();
     uint32_t lastMove = 0;
     countdown();
     while (true) {
+      if (btnTap()) { if (!pauseMenu()) return; }
       if (backHold()) return;
       int16_t tx, ty; adxlXYFiltered(tx, ty);
       if (millis() - lastMove > 150) {
@@ -608,9 +705,9 @@ void playMaze() {
           if (dy > 0) ny++;
           else if (dy < 0) ny--;
         }
-        if (nx >= 0 && nx < 16 && ny >= 0 && ny < 8 && maze[ny][nx] != '#') {
+        if (nx >= 0 && nx < MAZE_W && ny >= 0 && ny < MAZE_H && pgm_read_cell(mIdx, nx, ny) != '#') {
           px = nx; py = ny; lastMove = millis(); beep(700, 8);
-          if (maze[py][px] == 'G') {
+          if (pgm_read_cell(mIdx, px, py) == 'G') {
             uint16_t t = (uint16_t)((millis() - start) / 1000);
             u8g2.firstPage();
             do {
@@ -631,10 +728,11 @@ void playMaze() {
 
       u8g2.firstPage();
       do {
-        for (uint8_t y = 0; y < 8; y++) {
-          for (uint8_t x = 0; x < 16; x++) {
-            if (maze[y][x] == '#') u8g2.drawBox(x * 8, y * 8, 8, 8);
-            else if (maze[y][x] == 'G') u8g2.drawFrame(x * 8 + 1, y * 8 + 1, 6, 6);
+        for (uint8_t y = 0; y < MAZE_H; y++) {
+          for (uint8_t x = 0; x < MAZE_W; x++) {
+            char c = pgm_read_cell(mIdx, x, y);
+            if (c == '#') u8g2.drawBox(x * 8, y * 8, 8, 8);
+            else if (c == 'G') u8g2.drawFrame(x * 8 + 1, y * 8 + 1, 6, 6);
           }
         }
         u8g2.drawDisc(px * 8 + 4, py * 8 + 4, 3);
@@ -977,12 +1075,18 @@ const char d1[] PROGMEM = "Normal";
 const char d2[] PROGMEM = "Hard";
 const char* const diffItems[] PROGMEM = {d0, d1, d2};
 
-//const char b0[] PROGMEM = "Dim";
+// Fixed: this used to be missing "Dim" and "Medium" (only 3 pointers) while
+// still being told it had 5 items when the menu was drawn — that mismatch
+// read past the end of the array and was the root cause of the
+// Brightness/Difficulty menu misbehaving (garbage labels, wrong values
+// applied, occasional lock-up). Now it's a real 5-item list matching
+// applyBright()'s 0..4 index range.
+const char b0[] PROGMEM = "Dim";
 const char b1[] PROGMEM = "Low";
-//const char b2[] PROGMEM = "Medium";
+const char b2[] PROGMEM = "Medium";
 const char b3[] PROGMEM = "Bright";
 const char b4[] PROGMEM = "Max";
-const char* const brightItems[] PROGMEM = { b1, b3, b4};
+const char* const brightItems[] PROGMEM = {b0, b1, b2, b3, b4};
 
 // ══════════════════════════════════════════════════════════════════════════
 // SETUP & LOOP
@@ -992,6 +1096,11 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
   Wire.begin();
   Wire.setClock(400000);   // fast-mode I2C — snappier ADXL345 reads
+  // Without this, a glitched/unresponsive ADXL345 can make Wire.requestFrom()
+  // block forever inside adxlXY(), which is what was presenting as the
+  // Space Shooter (and other tilt games) randomly freezing mid-play. This
+  // caps any I2C transaction at 3ms and resets the bus instead of hanging.
+  Wire.setWireTimeout(3000, true);
   u8g2.begin();
   u8g2.setFont(u8g2_font_5x7_tf);
 
@@ -999,7 +1108,7 @@ void setup() {
   adxlWrite(0x31, 0x00); // ±2G
 
   gDiff   = EEPROM.read(EE_DIFF);   if (gDiff > 2)   gDiff = 1;
-  gBright = EEPROM.read(EE_BRIGHT); if (gBright > 4) gBright = 3;
+  gBright = EEPROM.read(EE_BRIGHT); if (gBright > 4) gBright = 2;
   applyBright();
 
   uint16_t jx = eeR(EE_JX); if (jx > 100 && jx < 900) jcx = jx;
